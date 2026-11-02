@@ -1,0 +1,10 @@
+{
+  "zoom": 1.1,
+  "sounds": {
+    "enabled": true
+  },
+  "minimum_contrast": 1,
+  "appearance": "dark",
+  "font": "D2Coding",
+  "ui_font": "D2Coding"
+}

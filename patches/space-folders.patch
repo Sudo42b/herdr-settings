@@ -1,0 +1,188 @@
+diff --git a/mods/space-folders/main.js b/mods/space-folders/main.js
+index 39a9349..da8ed35 100644
+--- a/mods/space-folders/main.js
++++ b/mods/space-folders/main.js
+@@ -13,7 +13,7 @@
+ 
+ import { View, div, svg } from "gpui-kit";
+ import { v_flex, h_flex, InputState, Input } from "gpui-base";
+-import { spaces, machines, panes, run, openOverlay, closeOverlay, props, exec, hc, theme, shared, setShared, watchFolder, window, layout, pickFolder, home, nextCommand } from "herdr";
++import { spaces, machines, panes, run, openOverlay, closeOverlay, props, exec, hc, theme, shared, setShared, watchFolder, window, layout, pickFolder, home, nextCommand, readTextFile, writeTextFile, notify } from "herdr";
+ 
+ // A machine's folders live in a file in its home, so every screen showing its
+ // spaces shows the same folders: { list: [{ id, name, folded }], of: { spaceId:
+@@ -27,10 +27,14 @@ const folders = (machine) => all()[key(machine)] ?? { list: [], of: {} };
+ const localId = (s) => (s.machine ? s.id.slice(s.machine.length + 1) : s.id);
+ const URGENT = ["blocked", "done", "working"];
+ 
++// Windows port: this computer has no `sh`, so its file goes through Herdr's own
++// file calls; other machines (Unix over ssh) keep `sh`.
++const localFile = () => `${home()}/.config/herdr-space-folders.json`;
++
+ async function readFolders(machine) {
+-  const r = await exec("sh", ["-c", `cat ${FILE} 2>/dev/null`], { on: machine });
++  const text = machine ? (await exec("sh", ["-c", `cat ${FILE} 2>/dev/null`], { on: machine })).stdout : await readTextFile(localFile());
+   try {
+-    const d = JSON.parse(r.stdout);
++    const d = JSON.parse(text);
+     return { list: d.list ?? [], of: d.of ?? {}, at: d.at ?? 0 };
+   } catch { return null; }
+ }
+@@ -39,7 +43,7 @@ async function readFolders(machine) {
+ const homes = {};
+ async function expand(machine, path) {
+   if (!path?.startsWith("~")) return path;
+-  homes[key(machine)] ??= (await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine })).stdout.trim();
++  homes[key(machine)] ??= machine ? (await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine })).stdout.trim() : home();
+   return homes[key(machine)] + path.slice(1);
+ }
+ 
+@@ -48,22 +52,26 @@ async function expand(machine, path) {
+ async function newSpaceIn(machine, id) {
+   setShared("space-folders.new", { machine, id, before: spaces().map((s) => s.id), until: Date.now() + 60000 });
+   const path = folders(machine).list.find((f) => f.id === id)?.path;
+-  const folder = path ? await expand(machine, path).catch(() => null) : null;
+-  run("space.new", { ...(machine ? { machine } : {}), ...(folder ? { folder } : {}) });
++  // No start folder: the machine's home, named outright (see newSpace).
++  const folder = await expand(machine, path ?? "~").catch(() => null);
++  // machine "" is this computer: omitted, Herdr takes the focused space's machine (a WSL one).
++  run("space.new", { machine: machine ?? "", ...(folder ? { folder } : {}) });
+ }
+ 
+ // A rule of "Collect spaces from" takes a folder and everything in it. "~" is
+ // any home, "*" any one folder name, and a rule starting with neither "/" nor
+ // "~" is a folder name at any depth ("wbso-ai").
++// Windows: backslashes count as "/", a drive path ("C:/code") is absolute, "~" is
++// also C:/Users/<name>, and case doesn't matter.
+ export function rule(pattern) {
+-  const p = pattern.trim().replace(/\/+$/, "");
++  const p = pattern.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+   if (!p) return null;
+   const body = p.replace(/^~/, "\u0000").split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")
+-    .replace("\u0000", "(?:/home/[^/]+|/Users/[^/]+|/root)");
+-  return new RegExp(`${/^[/~]/.test(p) ? "^" : "(?:^|/)"}${body}(?:/|$)`);
++    .replace("\u0000", "(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+)");
++  return new RegExp(`${/^([/~]|[A-Za-z]:\/)/.test(p) ? "^" : "(?:^|/)"}${body}(?:/|$)`, "i");
+ }
+ 
+-const collects = (f, path) => Boolean(path) && (f.match ?? "").split(",").some((p) => rule(p)?.test(path));
++const collects = (f, path) => Boolean(path) && (f.match ?? "").split(",").some((p) => rule(p)?.test(path.replace(/\\/g, "/")));
+ 
+ // Where a space goes: where it was dragged (or "" for out of every folder), else
+ // the first folder whose rules take the folder it works in.
+@@ -82,8 +90,38 @@ function machineFolder(m, rows, ps) {
+ function saveFolders(machine, data) {
+   const next = { list: data.list, of: data.of, at: Date.now() };
+   setShared("space-folders", { ...all(), [key(machine)]: next });
+-  exec("sh", ["-c", `mkdir -p ~/.config && printf '%s\\n' "$1" > ${FILE}.tmp && mv ${FILE}.tmp ${FILE}`, "sh", JSON.stringify(next)], { on: machine })
+-    .catch(() => null);
++  if (machine) {
++    exec("sh", ["-c", `mkdir -p ~/.config && printf '%s\\n' "$1" > ${FILE}.tmp && mv ${FILE}.tmp ${FILE}`, "sh", JSON.stringify(next)], { on: machine })
++      .catch(() => null);
++    return;
++  }
++  // writeTextFile replaces only the copy it read; one retry if another save got in between.
++  const write = async () => writeTextFile(localFile(), JSON.stringify(next) + "\n", await readTextFile(localFile()));
++  write().catch(() => write()).catch((e) => notify({ title: "Space folders", body: `Could not save: ${e?.message ?? e}`, level: "error" }));
++}
++
++// A Windows pick as WSL sees it: \\wsl.localhost\<distro>\x or \\wsl$\<distro>\x
++// is /x, E:\x is /mnt/e/x; anything else (a network share) has none.
++// shortcut: the distro in the UNC path isn't checked against the machine; fine with one distro.
++export function wslPath(p) {
++  const s = p.replace(/\\/g, "/");
++  const unc = s.match(/^\/\/wsl(?:\.localhost|\$)\/[^/]+(\/.*)?$/i);
++  if (unc) return unc[1]?.replace(/\/+$/, "") || "/";
++  const drive = s.match(/^([A-Za-z]):(\/.*)?$/);
++  return drive ? `/mnt/${drive[1].toLowerCase()}${(drive[2] ?? "").replace(/\/+$/, "")}` : null;
++}
++
++// Herdr's +: a new space on this computer starts in a picked folder (cancel: none);
++// on another machine, in its $HOME, named outright (WSL's core starts in /tmp otherwise).
++function newSpace(cx, machine) {
++  cx.spawn(async () => {
++    if (machine) {
++      const folder = await expand(machine, "~").catch(() => null);
++      return run("space.new", { machine, ...(folder ? { folder } : {}) });
++    }
++    const folder = await pickFolder({ prompt: "Folder for the new space" });
++    if (folder) run("space.new", { machine: "", folder });
++  });
+ }
+ 
+ function find(node, id) {
+@@ -179,6 +217,12 @@ export default class Spaces extends View {
+       for (;;) {
+         const c = String(await nextCommand()).split(".").pop();
+         if (c === "next" || c === "prev") this.step(c === "next" ? 1 : -1);
++        // "space-folders.new" (ctrl-shift-n, the + menu): on the focused space's machine,
++        // this computer as Herdr does, another machine in its $HOME rather than /tmp.
++        if (c === "new") {
++          const machine = spaces().find((s) => s.active)?.machine ?? null;
++          if (machine) newSpace(cx, machine); else run("space.new", { machine: "" });
++        }
+         cx.notify();
+       }
+     });
+@@ -398,12 +442,22 @@ export default class Spaces extends View {
+     closeOverlay(overlay);
+   }
+ 
+-  // The system's folder picker, for this computer: home written as "~".
++  // The system's folder picker, for this computer: home written as "~". A WSL
++  // machine uses the same Windows picker, its pick turned into a Linux path.
+   choose(cx) {
++    const { machine } = this.editing;
+     cx.spawn(async (cx) => {
++      if (machine) {
++        const wsl = await exec("sh", ["-c", "grep -qi microsoft /proc/version"], { on: machine }).catch(() => null);
++        if (wsl?.code !== 0) return notify({ title: "Space folders", body: "Choose works for this computer and WSL only.", level: "error" });
++      }
+       const picked = await pickFolder({ prompt: "Start new spaces in" });
+       if (!picked) return;
+-      this.path.set_value(picked.startsWith(home()) ? `~${picked.slice(home().length)}` : picked);
++      if (machine) {
++        const linux = wslPath(picked);
++        if (!linux) return notify({ title: "Space folders", body: `Not a WSL or drive path: ${picked}`, level: "error" });
++        this.path.set_value(linux);
++      } else this.path.set_value(picked.startsWith(home()) ? `~${picked.slice(home().length)}` : picked);
+       if (this.mirror) this.match.set_value(this.path.value());
+       cx.notify();
+     });
+@@ -518,7 +572,7 @@ export default class Spaces extends View {
+       .child(div().text_size(15).font_semibold().child("Edit folder"))
+       .child(field("Name", this.name, null))
+       .child(field("Start new spaces in", this.path, "Its + and New space here open a space there.",
+-        machine ? null : button("folder-choose", "Choose…", false, (_e, cx) => this.choose(cx))))
++        button("folder-choose", "Choose…", false, (_e, cx) => this.choose(cx))))
+       .child(field("Collect spaces from", this.match,
+         "Spaces working in these folders join this one. Comma-separated: a folder name like wbso-ai, or a path like ~/code/client-*."))
+       .child(h_flex().pt(4).gap(8).justify_end()
+@@ -578,14 +632,15 @@ export default class Spaces extends View {
+         .when(connected, el => el.child(div().id(`machine-folder-${m ?? "local"}`).flex_none().px(3).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
+           .on_click((_e, cx) => { cx.stop_propagation(); this.newFolder(m); }).child(svg("mods/workspace-chrome/folder-plus.svg").size(12))))
+         .when(connected, el => el.child(div().id(`machine-add-${m ?? "local"}`).flex_none().px(4).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
+-          .on_click((_e, cx) => { cx.stop_propagation(); run("space.new", m ? { machine: m } : {}); }).child("+")))
++          .on_click((_e, cx) => { cx.stop_propagation(); newSpace(cx, m); }).child("+")))
+         .child(div().size(6).rounded(3).flex_none().bg(connected ? t.ansi2 : t.dim))
+         .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(11).flex_none()));
+     const empty = h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().pl(nested ? 26 : 8).pr(8).gap(7).items_center().rounded(7)
+       .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+-      .on_click(() => run("space.new", m ? { machine: m } : {}))
++      .on_click((_e, cx) => newSpace(cx, m))
+       .child(svg("mods/workspace-chrome/plus.svg").size(12)).when(!collapsed, el => el.child("New space there"));
+-    const body = mine.length || guests.length ? this.foldered(mine, m, t, collapsed, { guests, nested, hidden: hidden || folded, seen })
++    // Folders stay in view when the machine has no spaces left, so their + still works.
++    const body = mine.length || guests.length || folders(m).list.length ? this.foldered(mine, m, t, collapsed, { guests, nested, hidden: hidden || folded, seen })
+       : [this.machineLoading(m) ? this.loadingRow(m, t, collapsed) : empty];
+     return hidden ? [] : [head, ...(folded ? [] : body)];
+   }
+@@ -734,7 +789,7 @@ export default class Spaces extends View {
+         .when(!collapsed, el => el.child("Spaces"))
+         .child(h_flex().gap(2)
+           .when(!collapsed, el => el.child(button("folder-new", "folder-plus", () => this.newFolder(null))))
+-          .child(button("space-new", "plus", () => run("space.new")))))
++          .child(button("space-new", "plus", (_e, cx) => newSpace(cx, null)))))
+       .child(v_flex().flex_1().min_h(0).px(8).pb(14).overflow_y_scrollbar().mode("always")
+         // Released anywhere but on a space or a folder: out of its folder.
+         .on_mouse_up("left", (_e, cx) => {

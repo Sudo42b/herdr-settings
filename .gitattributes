@@ -1,0 +1,2 @@
+# Patches carry the CRLF line endings of the files they apply to; keep their bytes.
+*.patch -text
